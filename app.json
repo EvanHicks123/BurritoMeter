@@ -1,4 +1,20 @@
 {
-  "name": "BurritoMeter",
-  "displayName": "BurritoMeter"
+  "expo": {
+    "name": "BurritoMeter",
+    "slug": "burrito-meter",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "web": {
+      "name": "Burrito-Meter",
+      "shortName": "Burrito",
+      "display": "standalone",
+      "backgroundColor": "#121212",
+      "themeColor": "#FF5722",
+      "description": "Debt tracking, but make it delicious."
+    },
+    "plugins": [
+      "expo-font"
+    ]
+  }
 }
