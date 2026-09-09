@@ -10,7 +10,10 @@ import { FontAwesome5, MaterialCommunityIcons, Ionicons } from '@expo/vector-ico
 // ─── Constants ────────────────────────────────────────────────────────────────
 const BURRITO_GOAL = 14.00;
 const GOOGLE_API_KEY = 'AIzaSyCSpbBW1sZr9meQCKtDdkV3r1tPzFGWQeA';
-const PROXY = 'https://corsproxy.io/?';
+
+// Known hardcoded spot for Peter's House
+const PETERS_HOUSE_COORDS = { lat: 48.4682, lon: -123.3083 };
+const PETERS_HOUSE_ADDR = '2276 Arbutus Road, Victoria, BC';
 
 const C = {
     bg:           '#101820', // Midnight Blue
@@ -24,7 +27,19 @@ const C = {
     whiteSub:     'rgba(240,246,255,0.55)',
     whiteMuted:   'rgba(240,246,255,0.22)',
     danger:       '#F87171',
+    success:      '#4ADE80', // Bank Green
     inputBg:      '#0d141b',
+};
+
+const showAlert = (title: string, message: string) => {
+    if (Platform.OS === 'web') {
+        const win = typeof globalThis !== 'undefined' ? (globalThis as any).window : null;
+        if (win?.alert) {
+            win.alert(`${title}: ${message}`);
+            return;
+        }
+    }
+    Alert.alert(title, message);
 };
 
 // ─── Web helpers ──────────────────────────────────────────────────────────────
@@ -62,20 +77,6 @@ function AnimatedCounter({ anim }: { anim: Animated.Value }) {
     return <Text style={S.metricValue}>{display}</Text>;
 }
 
-// ─── Hover Component (FIXED HITBOX) ───────────────────────────────────────────
-function HoverPress({ onPress, style, children }: { onPress?: () => void; style?: object | object[]; children: React.ReactNode; }) {
-    const scale = useRef(new Animated.Value(1)).current;
-    const spring = (toVal: number) => Animated.spring(scale, { toValue: toVal, useNativeDriver: true }).start();
-    return (
-        // Moved the width to the outer view, and the padding/colors to the TouchableOpacity
-        <Animated.View style={{ transform: [{ scale }], width: '100%' }}>
-            <TouchableOpacity activeOpacity={0.85} onPress={onPress} onPressIn={() => spring(0.97)} onPressOut={() => spring(1)} style={style}>
-                {children}
-            </TouchableOpacity>
-        </Animated.View>
-    );
-}
-
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
     const [efficiency, setEfficiency] = useState('6.3');
@@ -84,15 +85,22 @@ export default function App() {
     const [totalPaidOut, setTotalPaidOut] = useState(0);
     const [loading,    setLoading]    = useState(false);
 
+    // Transactions
+    const [transactions, setTransactions] = useState<any[]>([]);
+
     // Modals
     const [settleVisible, setSettleVisible] = useState(false);
     const [resetVisible,  setResetVisible]  = useState(false);
     const [subtractVisible, setSubtractVisible] = useState(false);
+    const [historyVisible, setHistoryVisible] = useState(false);
 
     // Inputs
     const [origin, setOrigin] = useState('');
+    const [originPlaceId, setOriginPlaceId] = useState('');
     const [destination, setDestination] = useState('');
+    const [destPlaceId, setDestPlaceId] = useState('');
     const [subtractAmount, setSubtractAmount] = useState('');
+    const [subtractLabel, setSubtractLabel] = useState('');
 
     // Modifiers
     const [roundTrip, setRoundTrip] = useState(false);
@@ -110,7 +118,6 @@ export default function App() {
     const { width, height } = useWindowDimensions();
 
     useEffect(() => {
-        // Load Total Debt
         AsyncStorage.getItem('@burrito_debt').then(saved => {
             if (saved !== null) {
                 const val = parseFloat(saved);
@@ -121,11 +128,12 @@ export default function App() {
             }
         });
 
-        // Load Total Paid Out
         AsyncStorage.getItem('@burrito_paid').then(saved => {
-            if (saved !== null) {
-                setTotalPaidOut(parseFloat(saved));
-            }
+            if (saved !== null) setTotalPaidOut(parseFloat(saved));
+        });
+
+        AsyncStorage.getItem('@burrito_history').then(saved => {
+            if (saved !== null) setTransactions(JSON.parse(saved));
         });
     }, [animTotal, animProgress]);
 
@@ -153,24 +161,56 @@ export default function App() {
     const fetchSuggestions = async (text: string, setFn: (v: any[]) => void, anim: Animated.Value) => {
         if (text.length < 3) { setFn([]); toggleDrop(anim, false); return; }
         try {
-            const url = `${PROXY}${encodeURIComponent(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${text}&components=country:ca&key=${GOOGLE_API_KEY}`)}`;
-            const res = await fetch(url);
-            const data: any = await res.json();
-            if (data.predictions?.length > 0) { setFn(data.predictions); toggleDrop(anim, true); }
-        } catch (error) { console.error(error); }
+            const res = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Goog-Api-Key': GOOGLE_API_KEY,
+                },
+                body: JSON.stringify({
+                    input: text,
+                    includedRegionCodes: ['ca'],
+                }),
+            });
+
+            const data = (await res.json()) as any;
+            if (data?.suggestions?.length > 0) {
+                const mapped = data.suggestions
+                    .filter((s: any) => s.placePrediction)
+                    .map((s: any) => ({
+                        place_id: s.placePrediction.placeId,
+                        description: s.placePrediction.text?.text || '',
+                    }));
+                setFn(mapped);
+                toggleDrop(anim, true);
+            } else {
+                setFn([]);
+                toggleDrop(anim, false);
+            }
+        } catch (error) {
+            console.error('Fetch suggestions error:', error);
+        }
+    };
+
+    const addTransaction = (amount: number, type: 'increase' | 'decrease', label: string) => {
+        const newTx = {
+            id: Date.now().toString(),
+            amount,
+            type,
+            label: label.trim() === '' ? 'Unknown' : label,
+            date: new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+        };
+        setTransactions(prev => {
+            const updated = [newTx, ...prev].slice(0, 100);
+            AsyncStorage.setItem('@burrito_history', JSON.stringify(updated));
+            return updated;
+        });
     };
 
     const calculateAndSave = async (km: number) => {
-        // 1. Double distance if "There and Back" is checked
         const finalKm = roundTrip ? km * 2 : km;
-
-        // 2. Calculate the raw total cost of the gas
         const totalGasCost = (finalKm / parseFloat(efficiency)) * parseFloat(gasPrice);
-
-        // 3. Take your 65% share
         const myShare = totalGasCost * 0.65;
-
-        // 4. Multiply by the number of trips (defaults to 1)
         const finalCost = myShare * tripCount;
 
         const next = totalOwed + finalCost;
@@ -178,28 +218,115 @@ export default function App() {
         runAnimations(next);
         await AsyncStorage.setItem('@burrito_debt', next.toString());
 
-        // Reset everything for the next trip
+        let tripLabel = destination ? `Trip to ${destination}` : 'Logged Trip';
+        if (tripCount > 1) tripLabel += ` (x${tripCount})`;
+        if (roundTrip) tripLabel += ' 🔄';
+        addTransaction(finalCost, 'increase', tripLabel);
+
         setOrigin('');
+        setOriginPlaceId('');
         setDestination('');
+        setDestPlaceId('');
         setRoundTrip(false);
         setTripCount(1);
         setOriginSuggestions([]);
         setDestSuggestions([]);
     };
 
+    const geocodeFallback = async (query: string) => {
+        try {
+            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
+            const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+            const data = (await res.json()) as any[];
+            if (Array.isArray(data) && data.length > 0) {
+                return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+            }
+        } catch (e) {
+            console.warn('Geocode query failed for:', query, e);
+        }
+        return null;
+    };
+
+    const getCoordinates = async (placeId: string, address: string) => {
+        if (address.toLowerCase().includes('arbutus') && address.includes('2276')) {
+            return PETERS_HOUSE_COORDS;
+        }
+
+        if (placeId) {
+            try {
+                const res = await fetch(`https://places.googleapis.com/v1/places/${placeId}?fields=location`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Goog-Api-Key': GOOGLE_API_KEY,
+                    },
+                });
+                const data = (await res.json()) as any;
+                if (data?.location) {
+                    return { lat: data.location.latitude, lon: data.location.longitude };
+                }
+            } catch (e) {
+                console.warn('Google Place details error, falling back to OSM:', e);
+            }
+        }
+
+        // Try raw address
+        let coord = await geocodeFallback(address);
+        if (coord) return coord;
+
+        // Clean out country and province formatting issues (e.g., ", BC, Canada")
+        const stripped = address.replace(/,\s*(Canada|BC|British Columbia)/gi, '').trim();
+        coord = await geocodeFallback(stripped);
+        if (coord) return coord;
+
+        // Extract just street number, street name, and city
+        const parts = stripped.split(',').map(p => p.trim());
+        if (parts.length >= 2) {
+            coord = await geocodeFallback(`${parts[0]}, ${parts[1]}`);
+            if (coord) return coord;
+        }
+
+        return null;
+    };
+
     const handleAddTrip = async () => {
         const manual = parseFloat(origin);
-        if (!isNaN(manual) && !destination) { await calculateAndSave(manual); return; }
-        if (!origin || !destination) { Alert.alert('Hold up!', 'Input needed.'); return; }
+        if (!isNaN(manual) && !destination) {
+            await calculateAndSave(manual);
+            return;
+        }
+
+        if (!origin || !destination) {
+            showAlert('Hold up!', 'Both starting point and destination are required.');
+            return;
+        }
+
         setLoading(true);
         try {
-            const apiUrl = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin)}&destinations=${encodeURIComponent(destination)}&key=${GOOGLE_API_KEY}`;
-            const res = await fetch(`${PROXY}${encodeURIComponent(apiUrl)}`);
-            const data: any = await res.json();
-            if (data.status === 'OK' && data.rows[0].elements[0].status === 'OK') {
-                await calculateAndSave(data.rows[0].elements[0].distance.value / 1000);
+            const originCoord = await getCoordinates(originPlaceId, origin);
+            const destCoord = await getCoordinates(destPlaceId, destination);
+
+            if (!originCoord || !destCoord) {
+                showAlert('Location Error', 'Could not pinpoint one of the addresses. Try typing the street and city.');
+                setLoading(false);
+                return;
             }
-        } catch { Alert.alert('Error', 'Check connection.'); } finally { setLoading(false); }
+
+            const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${originCoord.lon},${originCoord.lat};${destCoord.lon},${destCoord.lat}?overview=false`;
+            const routeRes = await fetch(osrmUrl);
+            const routeData = (await routeRes.json()) as any;
+
+            if (routeData?.routes && routeData.routes.length > 0) {
+                const km = routeData.routes[0].distance / 1000;
+                await calculateAndSave(km);
+            } else {
+                showAlert('Route Error', 'Could not find a driving route between these places.');
+            }
+        } catch (error) {
+            console.error('handleAddTrip error:', error);
+            showAlert('Error', 'Check connection or try again.');
+        } finally {
+            setLoading(false);
+        }
     };
 
     const handleSettle = async () => {
@@ -212,6 +339,8 @@ export default function App() {
 
         await AsyncStorage.setItem('@burrito_debt', next.toString());
         await AsyncStorage.setItem('@burrito_paid', nextPaid.toString());
+
+        addTransaction(BURRITO_GOAL, 'decrease', 'Settled 1 Burrito 🌮');
         setSettleVisible(false);
     };
 
@@ -220,7 +349,7 @@ export default function App() {
         const amount = parseFloat(cleanAmount);
 
         if (isNaN(amount) || amount <= 0) {
-            Alert.alert("Invalid Amount", "Please enter a valid number to subtract.");
+            showAlert("Invalid Amount", "Please enter a valid number to subtract.");
             return;
         }
 
@@ -233,8 +362,12 @@ export default function App() {
 
         await AsyncStorage.setItem('@burrito_debt', next.toString());
         await AsyncStorage.setItem('@burrito_paid', nextPaid.toString());
+
+        addTransaction(amount, 'decrease', subtractLabel);
+
         setSubtractVisible(false);
         setSubtractAmount('');
+        setSubtractLabel('');
     };
 
     const handleReset = async () => {
@@ -242,9 +375,11 @@ export default function App() {
         animTotal.setValue(0);
         animProgress.setValue(0);
         setTotalPaidOut(0);
+        setTransactions([]);
 
         await AsyncStorage.removeItem('@burrito_debt');
         await AsyncStorage.removeItem('@burrito_paid');
+        await AsyncStorage.removeItem('@burrito_history');
         setResetVisible(false);
     };
 
@@ -258,12 +393,20 @@ export default function App() {
             <KeyboardAvoidingView behavior="padding" style={{ flex: 1 }}>
                 <ScrollView contentContainerStyle={S.scroll} keyboardShouldPersistTaps="always" showsVerticalScrollIndicator={false}>
                     <View style={[S.card, { width: Math.min(width * 0.94, 520) }, webBoxShadow('0 8px 32px rgba(0,0,0,0.5)')]}>
+
                         <View style={S.header}>
                             <View><Text style={S.eyebrow}>FUEL DEBT TRACKER</Text><Text style={S.appTitle}>Burrito·Meter</Text></View>
-                            <View style={S.headerRight}>
-                                <AnimatedCounter anim={animTotal} />
-                                <Text style={S.debtLabel}>Total Owed</Text>
-                                <Text style={S.paidLabel}>Total Paid: ${totalPaidOut.toFixed(2)}</Text>
+
+                            <View style={S.headerRightGroup}>
+                                <TouchableOpacity onPress={() => setHistoryVisible(true)} style={S.historyIcon}>
+                                    <MaterialCommunityIcons name="history" size={26} color={C.whiteMuted} />
+                                </TouchableOpacity>
+
+                                <View style={S.headerRight}>
+                                    <AnimatedCounter anim={animTotal} />
+                                    <Text style={S.debtLabel}>Total Owed</Text>
+                                    <Text style={S.paidLabel}>Total Paid: ${totalPaidOut.toFixed(2)}</Text>
+                                </View>
                             </View>
                         </View>
 
@@ -295,21 +438,73 @@ export default function App() {
                         <View style={S.inputSection}>
                             <View style={[S.inputGroup, { zIndex: 3 }]}>
                                 <Text style={S.label}>ORIGIN</Text>
-                                <TextInput style={S.fintechInput} value={origin} onChangeText={t => { setOrigin(t); fetchSuggestions(t, setOriginSuggestions, originAnim); }} onBlur={() => setTimeout(() => { setOriginSuggestions([]); toggleDrop(originAnim, false); }, 180)} placeholder="Starting Point..." placeholderTextColor={C.whiteMuted} />
+                                <TextInput
+                                    style={S.fintechInput}
+                                    value={origin}
+                                    onChangeText={t => {
+                                        setOrigin(t);
+                                        setOriginPlaceId('');
+                                        fetchSuggestions(t, setOriginSuggestions, originAnim);
+                                    }}
+                                    onBlur={() => setTimeout(() => { setOriginSuggestions([]); toggleDrop(originAnim, false); }, 180)}
+                                    placeholder="Starting Point..."
+                                    placeholderTextColor={C.whiteMuted}
+                                />
                                 {originSuggestions.length > 0 && (
                                     <Animated.View style={[S.dropdown, { opacity: originAnim }]}>{originSuggestions.map(item => (
-                                        <TouchableOpacity key={item.place_id} style={S.dropdownItem} onPress={() => { setOrigin(item.description); setOriginSuggestions([]); toggleDrop(originAnim, false); }}><Text style={S.dropdownText}>{item.description}</Text></TouchableOpacity>
+                                        <TouchableOpacity
+                                            key={item.place_id}
+                                            style={S.dropdownItem}
+                                            onPress={() => {
+                                                setOrigin(item.description);
+                                                setOriginPlaceId(item.place_id);
+                                                setOriginSuggestions([]);
+                                                toggleDrop(originAnim, false);
+                                            }}
+                                        >
+                                            <Text style={S.dropdownText}>{item.description}</Text>
+                                        </TouchableOpacity>
                                     ))}</Animated.View>
                                 )}
-                                <TouchableOpacity onPress={() => setOrigin('2276 Arbutus Road, Victoria, BC')} style={S.shortcut}><Text style={S.shortcutText}>🏠 Peter's House</Text></TouchableOpacity>
+                                <TouchableOpacity
+                                    onPress={() => {
+                                        setOrigin(PETERS_HOUSE_ADDR);
+                                        setOriginPlaceId('');
+                                    }}
+                                    style={S.shortcut}
+                                >
+                                    <Text style={S.shortcutText}>🏠 Peter's House</Text>
+                                </TouchableOpacity>
                             </View>
 
                             <View style={[S.inputGroup, { zIndex: 2 }]}>
                                 <Text style={S.label}>DESTINATION</Text>
-                                <TextInput style={S.fintechInput} value={destination} onChangeText={t => { setDestination(t); fetchSuggestions(t, setDestSuggestions, destAnim); }} onBlur={() => setTimeout(() => { setDestSuggestions([]); toggleDrop(destAnim, false); }, 180)} placeholder="Where to?" placeholderTextColor={C.whiteMuted} />
+                                <TextInput
+                                    style={S.fintechInput}
+                                    value={destination}
+                                    onChangeText={t => {
+                                        setDestination(t);
+                                        setDestPlaceId('');
+                                        fetchSuggestions(t, setDestSuggestions, destAnim);
+                                    }}
+                                    onBlur={() => setTimeout(() => { setDestSuggestions([]); toggleDrop(destAnim, false); }, 180)}
+                                    placeholder="Where to?"
+                                    placeholderTextColor={C.whiteMuted}
+                                />
                                 {destSuggestions.length > 0 && (
                                     <Animated.View style={[S.dropdown, { opacity: destAnim }]}>{destSuggestions.map(item => (
-                                        <TouchableOpacity key={item.place_id} style={S.dropdownItem} onPress={() => { setDestination(item.description); setDestSuggestions([]); toggleDrop(destAnim, false); }}><Text style={S.dropdownText}>{item.description}</Text></TouchableOpacity>
+                                        <TouchableOpacity
+                                            key={item.place_id}
+                                            style={S.dropdownItem}
+                                            onPress={() => {
+                                                setDestination(item.description);
+                                                setDestPlaceId(item.place_id);
+                                                setDestSuggestions([]);
+                                                toggleDrop(destAnim, false);
+                                            }}
+                                        >
+                                            <Text style={S.dropdownText}>{item.description}</Text>
+                                        </TouchableOpacity>
                                     ))}</Animated.View>
                                 )}
                             </View>
@@ -319,7 +514,6 @@ export default function App() {
                                 <View style={[S.inputGroup, { flex: 1, marginLeft: 8 }]}><Text style={S.label}>Gas $/L</Text><TextInput style={S.fintechInput} value={gasPrice} onChangeText={setGasPrice} keyboardType="numeric" /></View>
                             </View>
 
-                            {/* Trip Multipliers Row */}
                             <View style={S.optionsRow}>
                                 <TouchableOpacity activeOpacity={0.8} onPress={() => setRoundTrip(!roundTrip)} style={S.checkboxRow}>
                                     <View style={[S.checkbox, roundTrip && S.checkboxActive]}>
@@ -343,19 +537,68 @@ export default function App() {
                             </View>
                         </View>
 
-                        <HoverPress onPress={handleAddTrip} style={S.cta}><Text style={S.ctaText}>{loading ? 'Calculating…' : 'Log Trip'}</Text></HoverPress>
-                        <TouchableOpacity onPress={() => setResetVisible(true)} style={S.resetRow}><Ionicons name="trash-outline" size={12} color={C.whiteMuted} /><Text style={S.resetText}> Nuclear Reset</Text></TouchableOpacity>
+                        <TouchableOpacity
+                            activeOpacity={0.8}
+                            onPress={handleAddTrip}
+                            style={S.cta}
+                        >
+                            <Text style={S.ctaText}>{loading ? 'Calculating…' : 'Log Trip'}</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity onPress={() => setResetVisible(true)} style={S.resetRow}>
+                            <Ionicons name="trash-outline" size={12} color={C.whiteMuted} />
+                            <Text style={S.resetText}> Nuclear Reset</Text>
+                        </TouchableOpacity>
                     </View>
                 </ScrollView>
             </KeyboardAvoidingView>
+
+            {/* Transaction History Modal */}
+            <Modal transparent visible={historyVisible} animationType="fade">
+                <View style={S.modalOverlay}>
+                    <View style={[S.modalCard, S.modalCardHistory, webOnly({ backdropFilter: 'blur(8px)' })]}>
+                        <View style={S.historyHeader}>
+                            <Text style={S.modalTitle}>Transaction Ledger</Text>
+                            <TouchableOpacity onPress={() => setHistoryVisible(false)}>
+                                <MaterialCommunityIcons name="close-circle" size={26} color={C.whiteMuted} />
+                            </TouchableOpacity>
+                        </View>
+
+                        <ScrollView style={S.fullWidth} showsVerticalScrollIndicator={false}>
+                            {transactions.length === 0 ? (
+                                <Text style={S.emptyText}>No transactions recorded yet.</Text>
+                            ) : (
+                                transactions.map((tx) => (
+                                    <View key={tx.id} style={S.txRow}>
+                                        <View style={S.txLeft}>
+                                            <MaterialCommunityIcons
+                                                name={tx.type === 'increase' ? 'arrow-up-circle' : 'arrow-down-circle'}
+                                                size={32}
+                                                color={tx.type === 'increase' ? C.success : C.danger}
+                                            />
+                                            <View style={S.txTextWrap}>
+                                                <Text style={S.txLabel} numberOfLines={1}>{tx.label}</Text>
+                                                <Text style={S.txDate}>{tx.date}</Text>
+                                            </View>
+                                        </View>
+                                        <Text style={[S.txAmount, { color: tx.type === 'increase' ? C.success : C.danger }]}>
+                                            {tx.type === 'increase' ? '+' : '-'}${tx.amount.toFixed(2)}
+                                        </Text>
+                                    </View>
+                                ))
+                            )}
+                        </ScrollView>
+                    </View>
+                </View>
+            </Modal>
 
             {/* Settle Burrito Modal */}
             <Modal transparent visible={settleVisible} animationType="fade">
                 <View style={S.modalOverlay}><View style={[S.modalCard, webOnly({ backdropFilter: 'blur(8px)' })]}>
                     <Text style={S.modalTitle}>Settle Debt</Text><Text style={S.modalBody}>Bought the burrito? Resolves ${BURRITO_GOAL.toFixed(2)}.</Text>
                     <View style={S.row}>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginRight: 6 }]} onPress={handleSettle}><Text style={S.modalBtnText}>Yes</Text></TouchableOpacity>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginLeft: 6, backgroundColor: '#222' }]} onPress={() => setSettleVisible(false)}><Text style={S.modalBtnText}>No</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfLeft]} onPress={handleSettle}><Text style={S.modalBtnText}>Yes</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfRight, S.modalBtnDark]} onPress={() => setSettleVisible(false)}><Text style={S.modalBtnText}>No</Text></TouchableOpacity>
                     </View>
                 </View></View>
             </Modal>
@@ -364,8 +607,9 @@ export default function App() {
             <Modal transparent visible={subtractVisible} animationType="fade">
                 <View style={S.modalOverlay}><View style={[S.modalCard, webOnly({ backdropFilter: 'blur(8px)' })]}>
                     <Text style={S.modalTitle}>Custom Deduct</Text><Text style={S.modalBody}>Subtract a specific dollar amount.</Text>
+
                     <TextInput
-                        style={[S.fintechInput, { width: '100%', marginBottom: 20, textAlign: 'center', fontSize: 20 }]}
+                        style={[S.fintechInput, S.subtractInputAmount]}
                         value={subtractAmount}
                         onChangeText={setSubtractAmount}
                         keyboardType="numeric"
@@ -373,9 +617,18 @@ export default function App() {
                         placeholderTextColor={C.whiteMuted}
                         autoFocus
                     />
+
+                    <TextInput
+                        style={[S.fintechInput, S.subtractInputLabel]}
+                        value={subtractLabel}
+                        onChangeText={setSubtractLabel}
+                        placeholder="Label (e.g. Venmo, Drinks)"
+                        placeholderTextColor={C.whiteMuted}
+                    />
+
                     <View style={S.row}>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginRight: 6 }]} onPress={handleCustomSubtract}><Text style={S.modalBtnText}>Subtract</Text></TouchableOpacity>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginLeft: 6, backgroundColor: '#222' }]} onPress={() => { setSubtractVisible(false); setSubtractAmount(''); }}><Text style={S.modalBtnText}>Cancel</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfLeft]} onPress={handleCustomSubtract}><Text style={S.modalBtnText}>Subtract</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfRight, S.modalBtnDark]} onPress={() => { setSubtractVisible(false); setSubtractAmount(''); setSubtractLabel(''); }}><Text style={S.modalBtnText}>Cancel</Text></TouchableOpacity>
                     </View>
                 </View></View>
             </Modal>
@@ -385,8 +638,8 @@ export default function App() {
                 <View style={S.modalOverlay}><View style={S.modalCard}>
                     <Text style={[S.modalTitle, { color: C.danger }]}>Reset System</Text><Text style={S.modalBody}>Wipe everything? No undo.</Text>
                     <View style={S.row}>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginRight: 6, backgroundColor: C.danger }]} onPress={handleReset}><Text style={S.modalBtnText}>Wipe</Text></TouchableOpacity>
-                        <TouchableOpacity style={[S.modalBtn, { flex: 1, marginLeft: 6, backgroundColor: '#222' }]} onPress={() => setResetVisible(false)}><Text style={S.modalBtnText}>Back</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfLeft, { backgroundColor: C.danger }]} onPress={handleReset}><Text style={S.modalBtnText}>Wipe</Text></TouchableOpacity>
+                        <TouchableOpacity style={[S.modalBtn, S.modalBtnHalfRight, S.modalBtnDark]} onPress={() => setResetVisible(false)}><Text style={S.modalBtnText}>Back</Text></TouchableOpacity>
                     </View>
                 </View></View>
             </Modal>
@@ -401,6 +654,8 @@ const S = StyleSheet.create({
     header: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 28 },
     eyebrow: { fontSize: 9, letterSpacing: 2, color: C.whiteMuted, marginBottom: 5 },
     appTitle: { fontSize: 24, fontWeight: '800', color: C.white },
+    headerRightGroup: { flexDirection: 'row', alignItems: 'center' },
+    historyIcon: { marginRight: 16, padding: 4 },
     headerRight: { alignItems: 'flex-end' },
     metricValue: { fontSize: 32, fontWeight: 'bold', color: C.gold },
     debtLabel: { fontSize: 9, color: C.whiteMuted, marginTop: 3 },
@@ -416,7 +671,7 @@ const S = StyleSheet.create({
     barLabelLeft: { fontSize: 11, color: C.blue },
     barLabelRight: { fontSize: 11, color: C.whiteMuted },
     shelf: { backgroundColor: C.surfaceHigh, borderRadius: 20, padding: 18, marginBottom: 18, minHeight: 88, justifyContent: 'center', alignItems: 'center' },
-    emptyText: { color: C.whiteMuted, fontSize: 13 },
+    emptyText: { color: C.whiteMuted, fontSize: 13, textAlign: 'center' },
     burritoGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 10 },
     burritoChip: { backgroundColor: C.goldDim, borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(239,192,80,0.2)' },
     plusChip: { backgroundColor: 'rgba(255,255,255,0.03)', borderColor: 'rgba(255,255,255,0.08)' },
@@ -429,8 +684,6 @@ const S = StyleSheet.create({
     dropdownText: { color: C.whiteSub, fontSize: 13 },
     shortcut: { marginTop: 10 },
     shortcutText: { color: C.blue, fontSize: 12, fontWeight: '800' },
-
-    // Checkbox and Stepper Styles
     optionsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, marginBottom: 8 },
     checkboxRow: { flexDirection: 'row', alignItems: 'center' },
     checkbox: { width: 22, height: 22, borderRadius: 6, borderWidth: 1, borderColor: C.whiteMuted, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
@@ -441,17 +694,33 @@ const S = StyleSheet.create({
     stepper: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.inputBg, borderRadius: 10, borderWidth: 1, borderColor: C.border },
     stepperBtn: { paddingHorizontal: 10, paddingVertical: 8 },
     stepperValue: { color: C.white, fontSize: 13, fontWeight: '700', minWidth: 24, textAlign: 'center' },
-
-    // Log Trip button (padding is now directly on the button to fix the hitbox)
     cta: { borderRadius: 18, padding: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: '#007BFF', marginBottom: 16 },
     ctaText: { color: '#fff', fontSize: 16, fontWeight: '900' },
-
     resetRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
     resetText: { color: C.whiteMuted, fontSize: 11, textTransform: 'uppercase' },
+
+    // Modals
     modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center' },
-    modalCard: { backgroundColor: C.surfaceHigh, padding: 30, borderRadius: 24, width: '85%', alignItems: 'center', borderWidth: 1, borderColor: C.border },
+    modalCard: { backgroundColor: C.surfaceHigh, padding: 30, borderRadius: 24, width: '85%', maxWidth: 450, alignItems: 'center', borderWidth: 1, borderColor: C.border },
+    modalCardHistory: { maxHeight: '80%', paddingHorizontal: 20 },
     modalTitle: { color: C.white, fontSize: 20, fontWeight: '900', marginBottom: 10 },
     modalBody: { color: C.whiteSub, fontSize: 14, textAlign: 'center', marginBottom: 20, lineHeight: 20 },
     modalBtn: { padding: 16, borderRadius: 14, backgroundColor: '#007BFF', alignItems: 'center', justifyContent: 'center' },
+    modalBtnHalfLeft: { flex: 1, marginRight: 6 },
+    modalBtnHalfRight: { flex: 1, marginLeft: 6 },
+    modalBtnDark: { backgroundColor: '#222' },
     modalBtnText: { color: '#fff', fontWeight: '900' },
+
+    subtractInputAmount: { width: '100%', marginBottom: 12, textAlign: 'center', fontSize: 24, fontWeight: 'bold' },
+    subtractInputLabel: { width: '100%', marginBottom: 24, textAlign: 'center' },
+
+    // History Modal specific
+    fullWidth: { width: '100%' },
+    historyHeader: { flexDirection: 'row', justifyContent: 'space-between', width: '100%', alignItems: 'center', marginBottom: 20, paddingBottom: 15, borderBottomWidth: 1, borderBottomColor: C.border },
+    txRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.03)' },
+    txLeft: { flexDirection: 'row', alignItems: 'center', flex: 1, marginRight: 15 },
+    txTextWrap: { marginLeft: 12 },
+    txLabel: { color: C.white, fontSize: 14, fontWeight: '600', marginBottom: 4 },
+    txDate: { color: C.whiteMuted, fontSize: 11 },
+    txAmount: { fontSize: 16, fontWeight: 'bold' },
 });
